@@ -1,0 +1,139 @@
+#! /bin/bash
+# Drop by chef
+
+echo > $LOGS
+exec 6>&1
+exec 1>>$LOGS
+exec 2>>$LOGS
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+<% if  @options["backup.log"] %>
+LOGS="<%=@options["backup.log"]%>_<%=@options["folder.name"]%>.log"
+<% else %>
+LOGS="/tmp/folder_backup"
+<% end %>
+
+DATE=` /bin/date --iso-8601=minutes|sed -e "s/T/_/g" -e "s/:/h/g" -e "s/+.*//g"`
+OLDDATE=` /bin/date  --date "1 day ago" --iso-8601=minutes|sed -e "s/T/_/g" -e "s/:/h/g" -e "s/+.*//g"`
+
+
+ERR=0
+FIND=$( which find )
+BTRFS=$( which btrfs )
+<% if @options["folder.name"] %>
+FOLDERNAME="<%= @options["folder.name"] %>"
+<% else %>
+echo "ERROR : no folder name to backup, exiting"
+exit 0
+<% end %>
+<% if @options["folder.path"] %>
+FOLDER="<%= @options["folder.path"] %>"
+<% else %>
+echo "ERROR : no folder to backup, exiting"
+exit 1
+<% end %>
+
+<% if @options["backup.pathdir"] %>
+BACKUPDIR="<%= @options["backup.pathdir"]  %>"
+BACKUPNAME="$BACKUPDIR/snap$DATE-$FOLDERNAME"
+<% else %>
+BACKUPDIR="/srv/sa-backup"
+BACKUPNAME="$BACKUPDIR/snap$DATE-$FOLDERNAME"
+<% end %>
+
+
+<%if @options["backup.retention"] %>
+RETENTION="<%= @options["backup.retention"] %>"
+<%else%>
+RETENTION="30"
+<%end%>
+
+echo "Begin : `date +%D--%H:%M:%S`"
+
+## Backup local
+echo "# Backup local"
+if [ -d $BACKUPNAME ]; then $BTRFS subvolume delete $BACKUPNAME; fi
+if [ ! -d $BACKUPDIR ]; then mkdir -p $BACKUPDIR; fi
+$BTRFS subvolume snapshot -r $LOCALOPT $FOLDER $BACKUPNAME
+if [ $? -eq 0 ]; then
+echo "  Local backup success"
+else
+echo "  ERROR : local backup failed"
+exit 1
+fi
+
+echo "# Remove local backups older than $RETENTION"
+ls -rd $BACKUPDIR/snap* | tail -n +$(( $RETENTION + 1 ))| while read snap
+do
+ $BTRFS subvolume delete "$snap"
+done
+
+echo "  Local old backup removed"
+
+#Backup distant
+echo "Remote backup"
+<% if @store_with["settings"] %>
+SFTPUSERNAME="<%=@store_with["settings"].fetch("sftp.username")%>"
+SFTPHOST="<%=@store_with["settings"].fetch("sftp.ip")%>"
+SFTPPORT="<%=@store_with["settings"].fetch("sftp.port")%>"
+SFTPREMOTEDIR="<%=@store_with["settings"].fetch("sftp.path")%>"
+RHOSTNAME="<%=@store_with["settings"].fetch("host.name")%>"
+HOSTNAME=$( hostname -s )
+        <%if @store_with["settings"].fetch("sftp.retention") %>
+REMOTERETENTION="<%= @store_with["settings"].fetch("sftp.retention") %>"
+	<%else%>
+REMOTERETENTION="30"
+	<%end%>
+	<% if @store_with["settings"].fetch("ssh.key") %>
+SSHKEY="-i <%=@store_with["settings"].fetch("ssh.key")%>"
+	<%else%> 
+SSHKEY=""
+	<%end%>
+ssh -p $SFTPPORT $SFTPUSERNAME@$SFTPHOST $SSHKEY "if [ ! -d $SFTPREMOTEDIR/btrfs ]; then sudo btrfs subvolume create $SFTPREMOTEDIR/btrfs; fi && if [ ! -d $SFTPREMOTEDIR/btrfs/$RHOSTNAME ]; then sudo btrfs subvolume create $SFTPREMOTEDIR/btrfs/$RHOSTNAME; fi "
+if [ $? -eq 0 ]; then
+ echo "Creation of remote is OK"
+ else
+ echo "ERROR : creation of remote dir over ssh failed"
+ ERR=2
+fi
+if [ -f ~sa-backup/last_run.txt ]; then
+  old_name=$( cat ~sa-backup/last_run.txt )
+  ssh $SSHKEY -p $SFTPPORT $SFTPUSERNAME@$SFTPHOST "ls $SFTPREMOTEDIR/btrfs/$RHOSTNAME|grep $old_name"
+  if [ $? -ne "0" ]; then
+   init=1
+  fi
+else 
+ init=1
+fi
+if [[ -n "$init" ]]; then
+ btrfs send "$BACKUPNAME" | ssh $SSHKEY -p $SFTPPORT $SFTPUSERNAME@$SFTPHOST  sudo btrfs receive "$SFTPREMOTEDIR/btrfs/$RHOSTNAME/"
+  if [ $? -eq 0 ]; then echo "   Send ok"; else echo "  Send Ko"; ERR=3; fi
+else
+ echo "not code yet"
+ OLDBACKUPNAME=$BACKUPDIR/$old_name
+ #btrfs send -p "$OLDBACKUPNAME" "$BACKUPNAME" | ssh $SSHKEY -p $SFTPPORT $SFTPUSERNAME@$SFTPHOST sudo btrfs receive "$SFTPREMOTEDIR/btrfs/$RHOSTNAME/"
+  if [ $? -eq 0 ]; then echo "   Send ok"; else echo "  Send Ko"; ERR=4; fi
+fi
+
+	##Remove local
+#	echo "Clean local :all these files will be deleted : "
+#	/usr/bin/find $LOCALDIR -ctime +$RETENTION | grep $FOLDERNAME
+#	/usr/bin/find $LOCALDIR -ctime +$RETENTION | grep $FOLDERNAME | /usr/bin/xargs rm -rf 
+#
+#	if [[ $ERR -eq "0" ]]; then
+#	echo "Clean remote dir"
+#	ssh $SSHKEY -p $SFTPPORT $SFTPUSERNAME@$SFTPHOST "/usr/bin/find $SFTPREMOTEDIR/$HOSTNAME -ctime +$REMOTERETENTION | /bin/grep \"folders/$FOLDERNAME\" | /usr/bin/xargs btrfs subvolume delete "
+#	ssh $SSHKEY -p $SFTPPORT $SFTPUSERNAME@$SFTPHOST "/usr/bin/find $SFTPREMOTEDIR/$HOSTNAME -type d -empty -exec rmdir {} \;"
+#
+#	fi
+if [ $ERR -eq 0 ]; then 
+echo "snap$DATE-$FOLDERNAME" > ~sa-backup/last_run.txt 
+fi
+echo "-###########################-"
+echo "End: `date +%D--%H:%M:%S`"
+
+exec 1>&6
+6<&-
+
+exit $ERR
+<%end%>
